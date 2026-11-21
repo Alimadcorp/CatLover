@@ -11,20 +11,33 @@ const app = new App({
   receiver
 })
 
-async function getThread (client, channel, thread_ts) {
-  let msgs = []
+async function getThread (client, channel, thread_ts, latest) {
+  const byTs = new Map()
   let cursor
   do {
     const res = await client.conversations.replies({
       channel,
       ts: thread_ts,
+      latest,
+      inclusive: true,
       limit: 200,
       cursor
     })
-    msgs.push(...res.messages)
+    for (const m of res.messages || []) {
+      byTs.set(m.ts, m)
+    }
     cursor = res.response_metadata?.next_cursor
   } while (cursor)
-  return msgs
+
+  // guarantee strict chronological order from parent (thread_ts) to latest
+  return [...byTs.values()].sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts))
+}
+
+function isGoMessage (text) {
+  if (!text) return false
+  // strip slack formatting (*, _, ~, `) and invisible unicode characters
+  const cleaned = text.replace(/[*_~`\u200B-\u200D\uFEFF]/g, '').trim()
+  return /^go!*$/i.test(cleaned)
 }
 
 app.event('app_mention', async ({ event, client, context }) => {
@@ -40,25 +53,36 @@ app.event('app_mention', async ({ event, client, context }) => {
     return
   }
 
-  const msgs = await getThread(client, channel, thread_ts)
+  const msgs = await getThread(client, channel, thread_ts, pingTs)
   if (!msgs.length) return
 
-  const host = msgs[0].user
+  const parent = msgs[0]
+  const host = parent.user
 
   let goIdx = -1
   for (let i = 1; i < msgs.length; i++) {
     const m = msgs[i]
-    if (parseFloat(m.ts) >= parseFloat(pingTs)) break
-    if (m.user === host && /^go!?$/i.test((m.text || '').trim())) {
+    if (m.ts === pingTs || parseFloat(m.ts) >= parseFloat(pingTs)) break
+    if (m.user === host && isGoMessage(m.text)) {
       goIdx = i
     }
   }
 
   if (goIdx === -1) {
+    console.log('GO not found:', {
+      totalFetched: msgs.length,
+      host,
+      parentTs: parent.ts,
+      pingTs,
+      sampleMsgs: msgs
+        .slice(0, 5)
+        .map(m => ({ ts: m.ts, user: m.user, text: m.text }))
+    })
+
     await client.chat.postMessage({
       channel,
       thread_ts,
-      text: `No \`GO!\` found from <@${host}> in thread.`
+      text: `No \`GO!\` found from <@${host}> across ${msgs.length} messages. Tell them to send \`GO!\` to start the match.`
     })
     return
   }
@@ -68,7 +92,7 @@ app.event('app_mention', async ({ event, client, context }) => {
 
   for (let i = goIdx + 1; i < msgs.length; i++) {
     const m = msgs[i]
-    if (parseFloat(m.ts) >= parseFloat(pingTs)) break
+    if (m.ts === pingTs || parseFloat(m.ts) >= parseFloat(pingTs)) break
     if (m.bot_id || !m.user) continue
 
     const u = m.user
@@ -89,7 +113,7 @@ app.event('app_mention', async ({ event, client, context }) => {
     await client.chat.postMessage({
       channel,
       thread_ts,
-      text: 'No `:cat-chips:` were sent before everyone got disqualified'
+      text: 'No valid `:cat-chips:` were sent before everyone got disqualified!'
     })
     return
   }
@@ -105,7 +129,7 @@ app.event('app_mention', async ({ event, client, context }) => {
   const out = [
     `:trophy: *Winner:* <@${winnerId}> with *${topScore}* :cat-chips:!`,
     '',
-    '*Everyone else:*',
+    '*Leaderboard:*',
     ...lines
   ].join('\n')
 
